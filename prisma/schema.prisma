@@ -1,0 +1,588 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==========================================
+// 1. SYSTEM ENUMS
+// ==========================================
+
+enum LocationType {
+  CENTRAL_WAREHOUSE
+  RETAIL_BRANCH
+}
+
+enum ChannelType {
+  ONLINE_STORE
+  BRANCH_POS
+}
+
+enum Role {
+  SUPER_ADMIN
+  BUSINESS_OWNER
+  WAREHOUSE_MANAGER
+  INVENTORY_STAFF
+  BRANCH_MANAGER
+  CASHIER
+  ECOMMERCE_MANAGER
+  FULFILLMENT_STAFF
+  FINANCE_MANAGER
+  CUSTOMER_SUPPORT
+  MARKETING_MANAGER
+}
+
+enum TransferStatus {
+  REQUESTED
+  APPROVED
+  PICKING
+  DISPATCHED_IN_TRANSIT
+  RECEIVED
+  DISCREPANCY_FLAGGED
+  CANCELLED
+}
+
+enum OrderFulfillmentStatus {
+  AWAITING_CONFIRMATION
+  CONFIRMED
+  ALLOCATED
+  PICKING
+  PACKED
+  READY_FOR_DISPATCH
+  SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED_DELIVERY
+  RTO
+  CANCELLED
+  CLOSED
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  PAID
+  FAILED
+  REFUNDED
+  COD_PENDING_COLLECTION
+  COD_REMITTED
+}
+
+enum ExchangeStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  PICKUP_SCHEDULED
+  RECEIVED
+  REPLACEMENT_SHIPPED
+  COMPLETED
+}
+
+enum ReturnRequestType {
+  EXCHANGE
+  REFUND
+}
+
+enum ReturnStatus {
+  REQUESTED
+  ELIGIBLE_APPROVED
+  INSPECTION_PENDING
+  RESTOCKED
+  EXCHANGE_ALLOCATED
+  REFUND_APPROVED
+  QUARANTINED
+  REJECTED
+}
+
+enum ConditionGrade {
+  GRADE_A_MINT
+  GRADE_B_MINOR_SCUFF
+  GRADE_C_DAMAGED_SOLE
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PUBLISHED
+  DEAD_LETTER
+}
+
+enum ReplenishmentAlertStatus {
+  OPEN
+  TRANSFER_SUGGESTED
+  PO_SUGGESTED
+  RESOLVED
+  DISMISSED
+}
+
+// ==========================================
+// 2. CORE BUSINESS & LOCATION ENTITIES
+// ==========================================
+
+model Location {
+  id        String       @id @default(uuid())
+  code      String       @unique // e.g., "CW-KHI-01", "RET-KHI-01"
+  name      String       // "Karachi Central Warehouse", "Clifton Branch"
+  type      LocationType @default(RETAIL_BRANCH)
+  city      String       @default("Karachi")
+  address   String
+  phone     String
+  timings   String?
+  isActive  Boolean      @default(true)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  staffUsers          StaffUser[]
+  stockBalances       StockBalance[]
+  stockMovements      StockMovement[]
+  outgoingTransfers   StockTransfer[]      @relation("SourceLocation")
+  incomingTransfers   StockTransfer[]      @relation("DestinationLocation")
+  ordersFulfilled     Order[]              @relation("FulfillmentLocation")
+  posReceipts         PosReceipt[]
+  purchaseOrders      PurchaseOrder[]
+  branchShifts        BranchShift[]
+  replenishmentAlerts ReplenishmentAlert[]
+}
+
+model StaffUser {
+  id           String    @id @default(uuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         Role      @default(CASHIER)
+  locationId   String?
+  location     Location? @relation(fields: [locationId], references: [id])
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  auditLogs    AuditLog[]
+  posReceipts  PosReceipt[]
+  branchShifts BranchShift[]
+}
+
+// ==========================================
+// 3. CATALOG & VARIANTS
+// ==========================================
+
+model Product {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  category    String   // 'men', 'women', 'kids', 'accessories'
+  subCategory String   // 'formal', 'casual', 'loafers', 'sneakers', 'peshawari'
+  brand       String   @default("Royal Step")
+  basePrice   Float
+  salePrice   Float?
+  costPrice   Float    @default(0) // COGS calculation
+  material    String
+  sole        String?
+  description String   @db.Text
+  images      String[]
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  variants ProductVariant[]
+  reviews  ProductReview[]
+}
+
+model ProductVariant {
+  id        String   @id @default(uuid())
+  sku       String   @unique
+  barcode   String?  @unique
+  sizeEU    Int
+  sizeUK    Float?
+  color     String
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  stockBalances       StockBalance[]
+  stockMovements      StockMovement[]
+  transferItems       StockTransferItem[]
+  poItems             PurchaseOrderItem[]
+  orderItems          OrderItem[]
+  replenishmentAlerts ReplenishmentAlert[]
+}
+
+// ==========================================
+// 4. MULTI-LOCATION INVENTORY & LEDGER
+// ==========================================
+
+model StockBalance {
+  id         String         @id @default(uuid())
+  locationId String
+  location   Location       @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  variantId  String
+  variant    ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  onHand           Int      @default(0) // Physical count in location
+  reservedOnline   Int      @default(0) // Reserved for pending online orders
+  reservedTransfer Int      @default(0) // Committed to branch replenishment
+  damaged          Int      @default(0) // Quarantined
+  safetyBuffer     Int      @default(0) // Minimum threshold alert level
+  updatedAt        DateTime @updatedAt
+
+  @@unique([locationId, variantId])
+}
+
+model StockMovement {
+  id          String         @id @default(uuid())
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  locationId  String
+  location    Location       @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  change      Int            // +/- quantity
+  reason      String         // "SUPPLIER_GRN", "ONLINE_FULFILLMENT", "POS_SALE", "TRANSFER_DISPATCH", "TRANSFER_RECEIVE", "RETURN_RESTOCK"
+  referenceId String?
+  actorEmail  String
+  createdAt   DateTime       @default(now())
+}
+
+// ==========================================
+// 5. PROCUREMENT & GOODS RECEIVING NOTE (GRN)
+// ==========================================
+
+model Supplier {
+  id             String          @id @default(uuid())
+  name           String
+  contactPerson  String?
+  phone          String
+  email          String?
+  address        String?
+  city           String          @default("Karachi")
+  purchaseOrders PurchaseOrder[]
+  createdAt      DateTime        @default(now())
+}
+
+model PurchaseOrder {
+  id         String   @id @default(uuid())
+  poNumber   String   @unique
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+  locationId String   // Receiving Warehouse
+  location   Location @relation(fields: [locationId], references: [id])
+  status     String   @default("PENDING")
+  totalCost  Float    @default(0)
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  items PurchaseOrderItem[]
+}
+
+model PurchaseOrderItem {
+  id               String         @id @default(uuid())
+  purchaseOrderId  String
+  purchaseOrder    PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  variantId        String
+  variant          ProductVariant @relation(fields: [variantId], references: [id])
+  quantityOrdered  Int
+  quantityReceived Int            @default(0)
+  unitCost         Float
+}
+
+// ==========================================
+// 6. WAREHOUSE-TO-BRANCH TRANSFER
+// ==========================================
+
+model StockTransfer {
+  id                    String         @id @default(uuid())
+  transferNumber        String         @unique
+  sourceLocationId      String
+  sourceLocation        Location       @relation("SourceLocation", fields: [sourceLocationId], references: [id])
+  destinationLocationId String
+  destinationLocation   Location       @relation("DestinationLocation", fields: [destinationLocationId], references: [id])
+  status                TransferStatus @default(REQUESTED)
+  notes                 String?
+  discrepancyNote       String?
+  requestedBy           String
+  approvedBy            String?
+  dispatchedAt          DateTime?
+  receivedAt            DateTime?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  items StockTransferItem[]
+}
+
+model StockTransferItem {
+  id               String         @id @default(uuid())
+  transferId       String
+  transfer         StockTransfer  @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  variantId        String
+  variant          ProductVariant @relation(fields: [variantId], references: [id])
+  quantitySent     Int
+  quantityReceived Int?           // Variance tracking
+}
+
+// ==========================================
+// 7. ONLINE ORDERS & E-COMMERCE
+// ==========================================
+
+model Order {
+  id                    String                 @id @default(uuid())
+  orderNumber           String                 @unique
+  channel               ChannelType            @default(ONLINE_STORE)
+  fulfillmentLocationId String?
+  fulfillmentLocation   Location?              @relation("FulfillmentLocation", fields: [fulfillmentLocationId], references: [id])
+
+  customerName String
+  phone        String
+  altPhone     String?
+  province     String  @default("Sindh")
+  city         String  @default("Karachi")
+  area         String
+  address      String
+  landmark     String?
+  notes        String?
+
+  paymentMethod     String                 // 'COD', 'CARD', 'EASYPAISA', 'JAZZCASH'
+  paymentStatus     PaymentStatus          @default(PENDING)
+  fulfillmentStatus OrderFulfillmentStatus @default(AWAITING_CONFIRMATION)
+
+  subtotal    Float
+  deliveryFee Float
+  discount    Float @default(0)
+  total       Float
+
+  itemSummary String @db.Text
+
+  // Leopards Courier Details
+  leopardCn       String?   @unique
+  leopardBookedAt DateTime?
+  codSettled      Boolean   @default(false)
+  codSettledAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items            OrderItem[]
+  returnRequests   ReturnRequest[]
+  exchangeRequests ExchangeRequest[]
+}
+
+model OrderItem {
+  id          String         @id @default(uuid())
+  orderId     String
+  order       Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  productName String
+  sizeEU      Int
+  color       String
+  unitPrice   Float
+  costPrice   Float          @default(0)
+  quantity    Int
+}
+
+// ==========================================
+// 8. RETURNS & SIZE EXCHANGE (FLOW 4D)
+// ==========================================
+
+model ReturnRequest {
+  id            String            @id @default(uuid())
+  ticketNumber  String            @unique // e.g. "RET-9821"
+  orderId       String
+  order         Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  channel       ChannelType       @default(ONLINE_STORE)
+  customerName  String
+  phone         String
+  productName   String
+  currentSize   Int
+  requestedSize Int?
+  requestType   ReturnRequestType @default(EXCHANGE)
+  reason        String
+  status        ReturnStatus      @default(REQUESTED)
+
+  // Inspection & QC Fields (Flow 4D)
+  inspectorStaffId String?
+  conditionGrade   ConditionGrade?
+  inspectNotes     String?         @db.Text
+
+  // Exchange Replacement Details
+  replacementVariantId   String?
+  replacementOrderNumber String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ExchangeRequest {
+  id            String         @id @default(uuid())
+  orderId       String
+  order         Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customerName  String
+  phone         String
+  currentSize   Int
+  requestedSize Int
+  productName   String
+  reason        String
+  status        ExchangeStatus @default(REQUESTED)
+  internalNotes String?        @db.Text
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+}
+
+// ==========================================
+// 9. PHYSICAL STORE POS & CASH REGISTERS
+// ==========================================
+
+model PosReceipt {
+  id              String    @id @default(uuid())
+  receiptNumber   String    @unique
+  offlineClientId String?   @unique
+  locationId      String
+  location        Location  @relation(fields: [locationId], references: [id])
+  staffUserId     String
+  staffUser       StaffUser @relation(fields: [staffUserId], references: [id])
+  cashierName     String
+
+  subtotal Float
+  discount Float @default(0)
+  total    Float
+
+  tenderType String // 'CASH', 'CARD', 'SPLIT'
+  cashAmount Float  @default(0)
+  cardAmount Float  @default(0)
+
+  itemsJson Json
+  syncedAt  DateTime @default(now())
+  createdAt DateTime @default(now())
+}
+
+model BranchShift {
+  id          String    @id @default(uuid())
+  locationId  String
+  location    Location  @relation(fields: [locationId], references: [id])
+  staffUserId String
+  staffUser   StaffUser @relation(fields: [staffUserId], references: [id])
+  cashierName String
+
+  openingFloat     Float     @default(0)
+  totalCashSales   Float     @default(0)
+  totalCardSales   Float     @default(0)
+  expectedCash     Float     @default(0)
+  actualCashInTill Float?
+  variance         Float?
+
+  status   String    @default("OPEN")
+  openedAt DateTime  @default(now())
+  closedAt DateTime?
+  notes    String?
+}
+
+// ==========================================
+// 10. MARKETING, CMS & SETTINGS
+// ==========================================
+
+model Coupon {
+  id            String    @id @default(uuid())
+  code          String    @unique // e.g., "EID2026", "WELCOME10"
+  discountType  String    // "PERCENT" | "FIXED"
+  discountValue Float
+  minOrderValue Float     @default(0)
+  usageLimit    Int?
+  usageCount    Int       @default(0)
+  expiresAt     DateTime?
+  isActive      Boolean   @default(true)
+}
+
+model ProductReview {
+  id           String   @id @default(uuid())
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  customerName String
+  rating       Int      @default(5)
+  comment      String   @db.Text
+  isApproved   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+}
+
+model StoreSetting {
+  id                    String   @id @default("default")
+  brandName             String   @default("Royal Step")
+  tagline               String   @default("Handcrafted Pure Leather Footwear")
+  supportEmail          String   @default("support@royalstep.pk")
+  supportPhone          String   @default("+92 21 35890000")
+  whatsappNumber        String   @default("923001234567")
+  freeShippingThreshold Float    @default(4999)
+  flatShippingRate      Float    @default(200)
+  heroHeading           String   @default("Step Into Pure Handcrafted Luxury")
+  heroSubheading        String   @default("Double-sole Kaptaans, classic Oxfords, and loafers built for all-day comfort.")
+  leopardsApiKey        String?
+  leopardsApiPassword   String?
+  updatedAt             DateTime @updatedAt
+}
+
+model AuditLog {
+  id          String     @id @default(uuid())
+  staffUserId String?
+  staffUser   StaffUser? @relation(fields: [staffUserId], references: [id], onDelete: SetNull)
+  action      String
+  entity      String
+  entityId    String?
+  oldValue    String?    @db.Text
+  newValue    String?    @db.Text
+  ipAddress   String?
+  createdAt   DateTime   @default(now())
+}
+
+// ==========================================
+// 11. TRANSACTIONAL OUTBOX & EVENT AUDIT
+// ==========================================
+
+model OutboxEvent {
+  id               String       @id @default(uuid())
+  idempotencyKey   String       @unique
+  aggregateType    String       // "ORDER", "TRANSFER", "POS_SALE", "INVENTORY"
+  aggregateId      String       // e.g., OrderId, TransferNumber, ReceiptNumber
+  eventType        String       // e.g., "INVENTORY.TRANSFER_DISPATCHED"
+  sourceApp        String       // "STORE_1_POS", "CENTRAL_WMS", "STOREFRONT"
+  sourceLocationId String?
+  payload          Json         // Full snapshot of event payload
+  retryCount       Int          @default(0)
+  errorMessage     String?      @db.Text
+  status           OutboxStatus @default(PENDING)
+  createdAt        DateTime     @default(now())
+  processedAt      DateTime?
+
+  @@index([status, createdAt])
+  @@index([aggregateType, aggregateId])
+}
+
+model IdempotencyRecord {
+  key            String   @id // SHA256 / UUID supplied by client
+  resourcePath   String   // e.g., "/api/pos/sync"
+  responseStatus Int      // e.g., 200, 201
+  responseBody   Json     // Cached JSON response for duplicate requests
+  createdAt      DateTime @default(now())
+  expiresAt      DateTime // TTL 72 hours
+}
+
+// ==========================================
+// 12. REPLENISHMENT THRESHOLD ALERTS
+// ==========================================
+
+model ReplenishmentAlert {
+  id               String                   @id @default(uuid())
+  locationId       String
+  location         Location                 @relation(fields: [locationId], references: [id])
+  variantId        String
+  variant          ProductVariant           @relation(fields: [variantId], references: [id])
+  currentOnHand    Int
+  minimumThreshold Int
+  suggestedAction  String                   // "INTERNAL_TRANSFER" | "PROCUREMENT_PO"
+  status           ReplenishmentAlertStatus @default(OPEN)
+  linkedReference  String?                  // TransferNumber or PONumber
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
+
+  @@unique([locationId, variantId, status])
+}
